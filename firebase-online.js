@@ -1,5 +1,5 @@
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/13.1.0/firebase-app.js';
-import { getAuth, onAuthStateChanged, signInAnonymously, signOut, EmailAuthProvider, linkWithCredential, signInWithEmailAndPassword } from 'https://www.gstatic.com/firebasejs/13.1.0/firebase-auth.js';
+import { getAuth, onAuthStateChanged, signInAnonymously, signOut, EmailAuthProvider, linkWithCredential, signInWithEmailAndPassword, deleteUser } from 'https://www.gstatic.com/firebasejs/13.1.0/firebase-auth.js';
 import { getFirestore, doc, getDoc, collection, query, orderBy, limit, getDocs, writeBatch, updateDoc } from 'https://www.gstatic.com/firebasejs/13.1.0/firebase-firestore.js';
 
 const firebaseConfig = {
@@ -10,6 +10,18 @@ const firebaseConfig = {
   messagingSenderId: '537426432976',
   appId: '1:537426432976:web:f36a1f5f5de980d2d39fd5'
 };
+// Position the score below the PAUSE button without modifying game.js.
+// The canvas score in game.js is written at (266, 65). Move only that draw call.
+const scoreCanvas = document.getElementById('field');
+if (scoreCanvas) {
+  const gameContext = scoreCanvas.getContext('2d');
+  const originalFillText = gameContext.fillText;
+  gameContext.fillText = function(text, x, y, ...args) {
+    if (x === 532 / 2 && y === 65) y = 112;
+    return originalFillText.call(this, text, x, y, ...args);
+  };
+}
+
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
@@ -44,6 +56,7 @@ function installUI() {
     <div id="online-current" hidden style="display:grid;gap:8px">
       <button id="online-protect" class="green" hidden>ADD PASSWORD TO THIS ACCOUNT</button>
       <button id="online-logout" class="gold" hidden>LOG OUT</button>
+      <button id="online-delete" type="button" hidden style="background:#f08d8d;color:#2a1010">DELETE ACCOUNT</button>
     </div>
     <button type="button" id="leaderboard-btn" class="purple">LEADERBOARD 🏆</button>`;
   $('menu').insertBefore(box, $('menu').querySelector('.footer'));
@@ -55,6 +68,7 @@ function installUI() {
   $('online-login').addEventListener('click', () => void login());
   $('online-protect').addEventListener('click', () => { $('online-form').hidden=false; $('online-register').textContent='SAVE PASSWORD'; $('online-password').focus(); });
   $('online-logout').addEventListener('click', () => void logout());
+  $('online-delete').addEventListener('click', () => showDeleteDialog());
   $('leaderboard-btn').addEventListener('click', () => void showLeaderboard());
   $('leaderboard-back').addEventListener('click', () => { $('leaderboard').classList.add('hidden'); $('menu').classList.remove('hidden'); });
   for(const id of ['play','shop-btn']) $(id).addEventListener('click',e=>{
@@ -66,6 +80,7 @@ function setUI() {
   $('online-current').hidden=!registered;
   $('online-protect').hidden=!registered||secure;
   $('online-logout').hidden=!registered||!secure;
+  $('online-delete').hidden=!registered;
   $('online-register').textContent=registered?'SAVE PASSWORD':'REGISTER';
 }
 function copyProgress(remote) {
@@ -151,6 +166,75 @@ async function logout(){
     location.reload();
   }catch(e){say('Logout failed.');console.error(e);busy=false;switching=false;}
 }
+// Permanent deletion is only possible for the Firebase identity currently signed in.
+// Deleting a nickname you cannot authenticate as would let anyone steal other accounts.
+function showDeleteDialog(){
+  if(!identity || !registered || busy) return;
+  if(document.getElementById('delete-account-dialog')) return;
+  const wrap=document.createElement('div');
+  wrap.id='delete-account-dialog';
+  wrap.setAttribute('role','dialog');
+  wrap.setAttribute('aria-modal','true');
+  wrap.setAttribute('aria-label','Delete player account');
+  wrap.style.cssText='position:fixed;inset:0;z-index:1000;background:#000b;display:grid;place-items:center;padding:16px';
+  const card=document.createElement('div');
+  card.style.cssText='max-width:380px;width:100%;background:#f1faff;border-radius:14px;padding:18px;color:#153047;display:grid;gap:12px';
+  const title=document.createElement('h2');title.textContent='DELETE ACCOUNT';title.style.cssText='margin:0;color:#a52020';
+  const description=document.createElement('p');
+  description.textContent='This permanently deletes your username, cloud score, coins and skins. Type DELETE to confirm. This cannot be undone.';
+  const confirmInput=document.createElement('input');confirmInput.placeholder='Type DELETE';confirmInput.setAttribute('aria-label','Type DELETE');
+  confirmInput.autocomplete='off';
+  confirmInput.style.cssText='font-size:16px;padding:10px;border:1px solid #778;border-radius:7px;width:100%';
+  const result=document.createElement('p');result.setAttribute('role','status');result.style.cssText='min-height:1em;color:#9b1c1c';
+  const buttons=document.createElement('div');buttons.style.cssText='display:flex;gap:10px;flex-wrap:wrap';
+  const cancel=document.createElement('button');cancel.type='button';cancel.textContent='CANCEL';cancel.className='gold';
+  const submit=document.createElement('button');submit.type='button';submit.textContent='DELETE FOREVER';submit.style.cssText='background:#f08d8d;color:#2a1010';
+  buttons.append(cancel,submit);card.append(title,description,confirmInput,result,buttons);wrap.append(card);document.body.append(wrap);
+  const close=()=>wrap.remove();cancel.addEventListener('click',close);
+  submit.addEventListener('click',async()=>{
+    if(confirmInput.value!=='DELETE'){result.textContent='Type DELETE exactly.';return;}
+    if(busy)return;
+    busy=true;submit.disabled=true;cancel.disabled=true;
+    try{
+      const user=auth.currentUser;
+      if(!user||user.uid!==identity.uid)throw new Error('Your login changed. Refresh the page.');
+      const userRef=doc(db,'users',user.uid);
+      const snap=await getDoc(userRef);
+      if(!snap.exists())throw new Error('Account record not found.');
+      const username=snap.data().usernameLower;
+      if(typeof username!=='string'||!allowed(username))throw new Error('Invalid stored username.');
+      const ownerRef=doc(db,'usernames',username);
+      const ownerSnap=await getDoc(ownerRef);
+      if(!ownerSnap.exists()||ownerSnap.data().uid!==user.uid)throw new Error('Username ownership does not match.');
+      // No password is requested. Firebase Auth can still require a recent sign-in.
+      if (!user.isAnonymous && user.metadata.lastSignInTime && Date.now()-Date.parse(user.metadata.lastSignInTime)>4*60*1000) {
+        throw new Error('For security, log out and log in again, then delete your account.');
+      }
+      // Both Firestore documents disappear together. Rules ensure the same UID owns them.
+      const batch=writeBatch(db);batch.delete(ownerRef);batch.delete(userRef);await batch.commit();
+      try{await deleteUser(user);}catch(authError){
+        // Firestore deletion already succeeded, but the Firebase Auth account remains.
+        // Do not claim it has been fully deleted.
+        console.error('Firebase Authentication deletion failed:',authError);
+        result.textContent='Game data deleted, but login deletion failed. Contact the game owner to remove the Firebase Auth user.';
+        submit.disabled=false;cancel.disabled=false;busy=false;return;
+      }
+      registered=false;secure=false;identity=null;remoteBest=0;
+      localStorage.removeItem('flappy-last-owner');
+      localStorage.setItem(LOCAL_KEY,JSON.stringify(defaults()));
+      location.reload();
+    }catch(error){
+      console.error('Delete account failed:',error);
+      result.textContent=error.code==='auth/wrong-password'||error.code==='auth/invalid-credential'?'Incorrect password.':
+      error.code==='permission-denied'?'Firestore rules must be updated to allow owner deletion.':
+      error.code==='auth/requires-recent-login'?'Firebase needs a fresh sign-in. Log out and log in again before deleting.':
+      'Deletion failed: '+(error.code||error.message);
+      submit.disabled=false;cancel.disabled=false;busy=false;
+    }
+  });
+  confirmInput.focus();
+}
+
 async function showLeaderboard(){
   $('menu').classList.add('hidden');$('leaderboard').classList.remove('hidden');$('leaderboard-content').textContent='Loading...';
   try{
